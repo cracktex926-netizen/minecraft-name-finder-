@@ -1,0 +1,97 @@
+the code if you dont feel safe
+#!/usr/bin/env python3
+# Minecraft PvP Name Scanner
+# Python 3.10+ | Standard library only (no pip installs required)
+#
+# IMPORTANT:
+# Mojang's public profile lookup can tell whether a name currently resolves to
+# a profile. A 204 response means "no profile found", NOT a guarantee that the
+# name is claimable. Name restrictions, cooldowns, reservations, or other
+# Minecraft services rules may still prevent claiming it.
+#
+# The Discord webhook is entered at runtime and is never saved to disk.
+
+import json
+import queue
+import random
+import re
+import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+
+APP_TITLE = "PvP Name Scanner"
+DB_PATH = Path(__file__).with_name("pvp_name_scanner_history.sqlite3")
+API_URL = "https://api.mojang.com/users/profiles/minecraft/{}"
+USER_AGENT = "PvPNameScanner/1.0 (personal-use)"
+MAX_NAME_LENGTH = 16
+MIN_NAME_LENGTH = 3
+
+# A small, curated vocabulary creates readable combinations rather than
+# completely random character strings.
+FOUR_LETTER_NAMES = [
+    "void", "vexx", "zyro", "kryp", "ryze", "nexx", "vayn", "zenn",
+    "aero", "onyx", "rift", "grim", "flux", "clut", "flic", "tapy",
+    "peak", "snipe", "rune", "vexy", "blit", "drip", "glow", "haze",
+    "faze", "cold", "dark", "rage", "swep", "wkey", "cryo", "fury",
+]
+PVP_ROOTS = [
+    "clutch", "strafe", "combo", "sweat", "sweaty", "aim", "aimbot",
+    "block", "hit", "reach", "click", "cps", "duel", "pot", "pearl",
+    "crits", "tap", "wtap", "stun", "combo", "flick", "track", "burst",
+    "ace", "snip", "peak", "drip", "vex", "void", "ryze", "kryp",
+]
+ROOTS = [
+    "void", "vex", "nova", "echo", "frost", "venom", "shade", "ghost",
+    "drift", "blaze", "storm", "night", "dusk", "raven", "wraith", "flux",
+    "onyx", "cryo", "slate", "zero", "swift", "clutch", "flick", "trace",
+    "pixel", "aero", "orbit", "lunar", "solar", "reign", "prime", "zen",
+    "grim", "hollow", "silent", "rapid", "toxic", "savage", "myth", "rift",
+    "viper", "ace", "rune", "kairo", "zyro", "nex", "ryze", "kryp",
+    "blitz", "tempo", "glide", "strafe", "combo", "tap", "snipe", "peak",
+    "chill", "cloud", "ember", "flare", "fable", "faint", "fury", "frosty",
+    "myst", "vanta", "aether", "cipher", "monk", "rival", "crisp", "clean",
+] + PVP_ROOTS
+PREFIXES = [
+    "x", "i", "v", "q", "z", "its", "im", "not", "real", "just",
+    "hey", "og", "the", "yo", "my",
+]
+SUFFIXES = [
+    "y", "z", "q", "xo", "ify", "ifyy", "qt", "v", "i", "ii", "on",
+    "er", "ed", "fn", "gg", "fps", "lol",
+]
+
+
+def valid_name(name: str) -> bool:
+    return (
+        MIN_NAME_LENGTH <= len(name) <= MAX_NAME_LENGTH
+        and re.fullmatch(r"[A-Za-z0-9_]+", name) is not None
+    )
+
+
+def generate_names(amount: int, excluded: set[str], stop_event: threading.Event):
+    """Generate unique 4–5 letter Minecraft PvP-style names."""
+    roots = list(dict.fromkeys(
+        FOUR_LETTER_NAMES
+        + [w for w in PVP_ROOTS if 4 <= len(w) <= 5]
+        + [w for w in ROOTS if 4 <= len(w) <= 5]
+    ))
+    # Short PvP fragments are combined to produce a large pool of readable
+    # 4–5 character candidates without digits or punctuation.
+    fragments = [
+        "v", "z", "x", "q", "ry", "zy", "ky", "vx", "nx", "cl",
+        "tap", "wt", "aim", "ace", "pvp", "hit", "pot", "flick",
+    ]
+    found = set()
+    while len(found) < amount and not stop_event.is_set():
+        style = random.randrange(6)
+        if style == 0:
+            name = random.choice(roots)
+        elif style == 1:
