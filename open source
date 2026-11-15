@@ -1,119 +1,96 @@
-                    break
+#!/usr/bin/env python3
+# Minecraft PvP Name Scanner
+# Python 3.10+ | Standard library only (no pip installs required)
+#
+# IMPORTANT:
+# Mojang's public profile lookup can tell whether a name currently resolves to
+# a profile. A 204 response means "no profile found", NOT a guarantee that the
+# name is claimable. Name restrictions, cooldowns, reservations, or other
+# Minecraft services rules may still prevent claiming it.
+#
+# The Discord webhook is entered at runtime and is never saved to disk.
 
-            if self.webhook:
-                self.webhook.flush()
-            self.ui_queue.put(("finished", self.stop_event.is_set()))
-        except Exception as exc:
-            self.log(f"Scan stopped: {exc}")
-            if self.webhook:
-                self.webhook.flush()
-            self.ui_queue.put(("finished", True))
+import json
+import queue
+import random
+import re
+import sqlite3
+import string
+import threading
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
-    def stop_scan(self):
-        if self.running:
-            self.stop_event.set()
-            self.log("Stop requested. Waiting for active requests to finish …")
-            self.stop_btn.configure(state="disabled")
 
-    def _process_queue(self):
-        try:
-            while True:
-                item = self.ui_queue.get_nowait()
-                kind = item[0]
-                if kind == "log":
-                    self.log_box.configure(state="normal")
-                    self.log_box.insert(tk.END, item[1] + "\n")
-                    self.log_box.see(tk.END)
-                    self.log_box.configure(state="disabled")
-                elif kind == "known":
-                    self.known_count = item[1]
-                elif kind == "total":
-                    self.total = item[1]
-                elif kind == "progress":
-                    _, name, result = item
-                    self.checked += 1
-                    if result == "not_found" and name:
-                        self.results.append(name)
-                        self.result_box.insert(tk.END, name)
-                    elif result == "error":
-                        self.errors += 1
-                    pct = self.checked / self.total * 100 if self.total else 0
-                    self.progress.configure(value=pct)
-                    self.progress_label.configure(
-                        text=f"Live scan · {self.checked:,} / {self.total:,} checked · {pct:.1f}%"
-                    )
-                    self.found_card.value_label.configure(text=str(len(self.results)))
-                    self.scanned_card.value_label.configure(text=f"{self.checked:,}")
-                    self.error_card.value_label.configure(text=str(self.errors))
-                    self.available_count.configure(text=str(len(self.results)))
-                elif kind == "finished":
-                    self.running = False
-                    self.start_btn.configure(state="normal")
-                    self.stop_btn.configure(state="disabled")
-                    self.log("Scan stopped." if item[1] else "Scan completed.")
-        except queue.Empty:
-            pass
-        self.root.after(100, self._process_queue)
+APP_TITLE = "PvP Name Scanner"
+DB_PATH = Path(__file__).with_name("pvp_name_scanner_history.sqlite3")
+API_URL = "https://api.mojang.com/users/profiles/minecraft/{}"
+USER_AGENT = "PvPNameScanner/1.0 (personal-use)"
+MAX_NAME_LENGTH = 16
+MIN_NAME_LENGTH = 3
 
-    def clear_results(self):
-        if self.running:
+# A small, curated vocabulary creates readable combinations rather than
+# completely random character strings.
+FOUR_LETTER_NAMES = [
+    "void", "vexx", "zyro", "kryp", "ryze", "nexx", "vayn", "zenn",
+    "aero", "onyx", "rift", "grim", "flux", "clut", "flic", "tapy",
+    "peak", "snipe", "rune", "vexy", "blit", "drip", "glow", "haze",
+    "faze", "cold", "dark", "rage", "swep", "wkey", "cryo", "fury",
+]
+PVP_ROOTS = [
+    "clutch", "strafe", "combo", "sweat", "sweaty", "aim", "aimbot",
+    "block", "hit", "reach", "click", "cps", "duel", "pot", "pearl",
+    "crits", "tap", "wtap", "stun", "combo", "flick", "track", "burst",
+    "ace", "snip", "peak", "drip", "vex", "void", "ryze", "kryp",
+]
+ROOTS = [
+    "void", "vex", "nova", "echo", "frost", "venom", "shade", "ghost",
+    "drift", "blaze", "storm", "night", "dusk", "raven", "wraith", "flux",
+    "onyx", "cryo", "slate", "zero", "swift", "clutch", "flick", "trace",
+    "pixel", "aero", "orbit", "lunar", "solar", "reign", "prime", "zen",
+    "grim", "hollow", "silent", "rapid", "toxic", "savage", "myth", "rift",
+    "viper", "ace", "rune", "kairo", "zyro", "nex", "ryze", "kryp",
+    "blitz", "tempo", "glide", "strafe", "combo", "tap", "snipe", "peak",
+    "chill", "cloud", "ember", "flare", "fable", "faint", "fury", "frosty",
+    "myst", "vanta", "aether", "cipher", "monk", "rival", "crisp", "clean",
+] + PVP_ROOTS
+PREFIXES = [
+    "x", "i", "v", "q", "z", "its", "im", "not", "real", "just",
+    "hey", "og", "the", "yo", "my",
+]
+SUFFIXES = [
+    "y", "z", "q", "xo", "ify", "ifyy", "qt", "v", "i", "ii", "on",
+    "er", "ed", "fn", "gg", "fps", "lol",
+]
+
+
+def valid_name(name: str) -> bool:
+    return (
+        MIN_NAME_LENGTH <= len(name) <= MAX_NAME_LENGTH
+        and re.fullmatch(r"[A-Za-z0-9_]+", name) is not None
+    )
+
+
+def generate_names(amount: int, excluded: set[str], stop_event: threading.Event,
+                   min_len: int = 4, max_len: int = 5):
+    """Generate unique Minecraft-compatible names in the selected length range."""
+    roots = list(dict.fromkeys(
+        [w.lower() for w in FOUR_LETTER_NAMES + PVP_ROOTS + ROOTS
+         if min_len <= len(w) <= max_len and w.isalpha()]
+    ))
+    alphabet = string.ascii_lowercase
+    found = set()
+    # First use curated names, then generate additional short pronounceable
+    # combinations. The 4–5 letter search space is large enough for 50k uniques.
+    random.shuffle(roots)
+    for name in roots:
+        if stop_event.is_set() or len(found) >= amount:
             return
-        self.results.clear()
-        self.result_box.delete(0, tk.END)
-        self.available_count.configure(text="0")
-        self.found_card.value_label.configure(text="0")
-        self.log("Visible result list cleared. Local duplicate history remains intact.")
-
-    def copy_results(self):
-        if not self.results:
-            messagebox.showinfo("No results", "There are no results to copy yet.")
-            return
-        self.root.clipboard_clear()
-        self.root.clipboard_append("\n".join(self.results))
-        self.log(f"Copied {len(self.results)} names to clipboard.")
-
-    def save_results(self):
-        if not self.results:
-            messagebox.showinfo("No results", "There are no results to save yet.")
-            return
-        path = filedialog.asksaveasfilename(
-            title="Save results", defaultextension=".txt",
-            filetypes=[("Text file", "*.txt"), ("CSV file", "*.csv")]
-        )
-        if not path:
-            return
-        try:
-            if path.lower().endswith(".csv"):
-                content = "name,note\n" + "\n".join(
-                    f"{n},no profile found - claimability not guaranteed" for n in self.results
-                )
-            else:
-                content = (
-                    "Minecraft PvP names (4–5 letters)\n"
-                    "No profile found by API; claimability is not guaranteed.\n\n"
-                    + "\n".join(self.results)
-                )
-            Path(path).write_text(content, encoding="utf-8")
-            self.log(f"Saved results to {path}")
-        except OSError as exc:
-            messagebox.showerror("Save failed", str(exc))
-
-    def _on_close(self):
-        if self.running:
-            if not messagebox.askyesno("Exit", "Stop the scan and close the app?"):
-                return
-            self.stop_event.set()
-        try:
-            self.history.close()
-        except Exception:
-            pass
-        self.root.destroy()
-
-def main():
-    root = tk.Tk()
-    ScannerApp(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+        if name not in excluded and name not in found:
+            found.add(name)
+            yield name
