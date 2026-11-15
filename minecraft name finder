@@ -1,0 +1,119 @@
+                    break
+
+            if self.webhook:
+                self.webhook.flush()
+            self.ui_queue.put(("finished", self.stop_event.is_set()))
+        except Exception as exc:
+            self.log(f"Scan stopped: {exc}")
+            if self.webhook:
+                self.webhook.flush()
+            self.ui_queue.put(("finished", True))
+
+    def stop_scan(self):
+        if self.running:
+            self.stop_event.set()
+            self.log("Stop requested. Waiting for active requests to finish …")
+            self.stop_btn.configure(state="disabled")
+
+    def _process_queue(self):
+        try:
+            while True:
+                item = self.ui_queue.get_nowait()
+                kind = item[0]
+                if kind == "log":
+                    self.log_box.configure(state="normal")
+                    self.log_box.insert(tk.END, item[1] + "\n")
+                    self.log_box.see(tk.END)
+                    self.log_box.configure(state="disabled")
+                elif kind == "known":
+                    self.known_count = item[1]
+                elif kind == "total":
+                    self.total = item[1]
+                elif kind == "progress":
+                    _, name, result = item
+                    self.checked += 1
+                    if result == "not_found" and name:
+                        self.results.append(name)
+                        self.result_box.insert(tk.END, name)
+                    elif result == "error":
+                        self.errors += 1
+                    pct = self.checked / self.total * 100 if self.total else 0
+                    self.progress.configure(value=pct)
+                    self.progress_label.configure(
+                        text=f"Live scan · {self.checked:,} / {self.total:,} checked · {pct:.1f}%"
+                    )
+                    self.found_card.value_label.configure(text=str(len(self.results)))
+                    self.scanned_card.value_label.configure(text=f"{self.checked:,}")
+                    self.error_card.value_label.configure(text=str(self.errors))
+                    self.available_count.configure(text=str(len(self.results)))
+                elif kind == "finished":
+                    self.running = False
+                    self.start_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
+                    self.log("Scan stopped." if item[1] else "Scan completed.")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._process_queue)
+
+    def clear_results(self):
+        if self.running:
+            return
+        self.results.clear()
+        self.result_box.delete(0, tk.END)
+        self.available_count.configure(text="0")
+        self.found_card.value_label.configure(text="0")
+        self.log("Visible result list cleared. Local duplicate history remains intact.")
+
+    def copy_results(self):
+        if not self.results:
+            messagebox.showinfo("No results", "There are no results to copy yet.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(self.results))
+        self.log(f"Copied {len(self.results)} names to clipboard.")
+
+    def save_results(self):
+        if not self.results:
+            messagebox.showinfo("No results", "There are no results to save yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save results", defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("CSV file", "*.csv")]
+        )
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".csv"):
+                content = "name,note\n" + "\n".join(
+                    f"{n},no profile found - claimability not guaranteed" for n in self.results
+                )
+            else:
+                content = (
+                    "Minecraft PvP names (4–5 letters)\n"
+                    "No profile found by API; claimability is not guaranteed.\n\n"
+                    + "\n".join(self.results)
+                )
+            Path(path).write_text(content, encoding="utf-8")
+            self.log(f"Saved results to {path}")
+        except OSError as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def _on_close(self):
+        if self.running:
+            if not messagebox.askyesno("Exit", "Stop the scan and close the app?"):
+                return
+            self.stop_event.set()
+        try:
+            self.history.close()
+        except Exception:
+            pass
+        self.root.destroy()
+
+def main():
+    root = tk.Tk()
+    ScannerApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
